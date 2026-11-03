@@ -1,0 +1,130 @@
+export type LatLng = { latitude: number; longitude: number };
+export type Vehicle = 'moto' | 'car' | 'bike';
+export type Mode = 'loop' | 'out' | 'pick';
+export type Direction = 'Any' | 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
+
+export const DIRECTIONS: Direction[] = ['Any', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const BEARING: Record<Exclude<Direction, 'Any'>, number> = {
+  N: 0, NE: 45, E: 90, SE: 135, S: 180, SW: 225, W: 270, NW: 315,
+};
+
+// Typical average speed (km/h) including lights and traffic.
+export const SPEED_KMH: Record<Vehicle, number> = { moto: 35, car: 30, bike: 16 };
+
+// Roads wander: real distance is roughly this much longer than a straight line.
+const ROAD_FACTOR = 1.35;
+const EARTH_KM = 6371;
+const rad = (d: number) => (d * Math.PI) / 180;
+const deg = (r: number) => (r * 180) / Math.PI;
+
+export function move(p: LatLng, bearingDeg: number, km: number): LatLng {
+  const b = rad(bearingDeg);
+  const d = km / EARTH_KM;
+  const la = rad(p.latitude);
+  const lo = rad(p.longitude);
+  const la2 = Math.asin(Math.sin(la) * Math.cos(d) + Math.cos(la) * Math.sin(d) * Math.cos(b));
+  const lo2 = lo + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(la), Math.cos(d) - Math.sin(la) * Math.sin(la2));
+  return { latitude: deg(la2), longitude: ((deg(lo2) + 540) % 360) - 180 };
+}
+
+export function targetKm(minutes: number, vehicle: Vehicle) {
+  return (minutes / 60) * SPEED_KMH[vehicle];
+}
+
+// Small seeded RNG so "scale and retry" keeps the same route shape.
+function rng(seed: number) {
+  let s = Math.floor(seed * 2147483646) + 1;
+  return () => (s = (s * 16807) % 2147483647) / 2147483647;
+}
+
+/** Waypoints (excluding start/finish) for a loop or an out-and-back ride. */
+export function generateWaypoints(
+  start: LatLng,
+  mode: Exclude<Mode, 'pick'>,
+  km: number,
+  direction: Direction,
+  seed: number,
+  scale = 1,
+): LatLng[] {
+  const rand = rng(seed);
+  const straight = (km / ROAD_FACTOR) * scale;
+  const bearing = direction === 'Any' ? rand() * 360 : BEARING[direction] + (rand() - 0.5) * 30;
+
+  if (mode === 'out') return [move(start, bearing, straight / 2)];
+
+  // Loop: start sits on a circle; drop 3 points around it.
+  const r = straight / (2 * Math.PI);
+  const center = move(start, bearing, r);
+  const startAngle = (bearing + 180) % 360;
+  const dir = rand() < 0.5 ? 1 : -1;
+  const pts: LatLng[] = [];
+  for (let k = 1; k <= 3; k++) {
+    const a = startAngle + dir * (k * 90 + (rand() - 0.5) * 30);
+    pts.push(move(center, a, r * (0.85 + rand() * 0.3)));
+  }
+  return pts;
+}
+
+export type RoadRoute = {
+  coords: LatLng[];
+  km: number;
+  snapped: LatLng[]; // each input point moved onto the nearest road
+};
+
+// Free OpenStreetMap routing (FOSSGIS). Fine for personal use; swap for your own server or a paid API at scale.
+const OSRM_BASE: Record<Vehicle, string> = {
+  moto: 'https://routing.openstreetmap.de/routed-car/route/v1/driving/',
+  car: 'https://routing.openstreetmap.de/routed-car/route/v1/driving/',
+  bike: 'https://routing.openstreetmap.de/routed-bike/route/v1/driving/',
+};
+
+export async function fetchRoadRoute(points: LatLng[], vehicle: Vehicle, signal?: AbortSignal): Promise<RoadRoute> {
+  const path = points.map((p) => `${p.longitude.toFixed(6)},${p.latitude.toFixed(6)}`).join(';');
+  const res = await fetch(`${OSRM_BASE[vehicle]}${path}?overview=full&geometries=geojson`, { signal });
+  if (!res.ok) throw new Error(`Routing failed (${res.status})`);
+  const json = await res.json();
+  if (json.code !== 'Ok' || !json.routes?.length) throw new Error(json.message || 'No road route found');
+  const route = json.routes[0];
+  return {
+    coords: route.geometry.coordinates.map(([lng, lat]: [number, number]) => ({ latitude: lat, longitude: lng })),
+    km: route.distance / 1000,
+    snapped: json.waypoints.map((w: { location: [number, number] }) => ({ latitude: w.location[1], longitude: w.location[0] })),
+  };
+}
+
+/**
+ * Generate a ride and fit it to roads. If the road distance is far off the target,
+ * resize the shape and try again (same seed, so it keeps its look).
+ */
+export async function planRide(opts: {
+  start: LatLng;
+  finish: LatLng | null;
+  mode: Exclude<Mode, 'pick'>;
+  minutes: number;
+  vehicle: Vehicle;
+  direction: Direction;
+  seed: number;
+  signal?: AbortSignal;
+}): Promise<{ waypoints: LatLng[]; road: RoadRoute | null }> {
+  const km = targetKm(opts.minutes, opts.vehicle);
+  let scale = 1;
+  let best: { waypoints: LatLng[]; road: RoadRoute | null } | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const wps = generateWaypoints(opts.start, opts.mode, km, opts.direction, opts.seed, scale);
+    const pts = [opts.start, ...wps, opts.finish ?? opts.start];
+    let road: RoadRoute;
+    try {
+      road = await fetchRoadRoute(pts, opts.vehicle, opts.signal);
+    } catch (e) {
+      if (opts.signal?.aborted) throw e;
+      return best ?? { waypoints: wps, road: null }; // offline: still usable, the nav app routes it
+    }
+    // Use the road-snapped stops so the nav app doesn't aim at a lake or a rooftop.
+    const candidate = { waypoints: road.snapped.slice(1, -1), road };
+    if (!best || Math.abs(road.km - km) < Math.abs(best.road!.km - km)) best = candidate;
+    const ratio = road.km / km;
+    if (ratio > 0.8 && ratio < 1.25) break;
+    scale *= km / road.km;
+  }
+  return best!;
+}
