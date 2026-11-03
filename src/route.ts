@@ -1,3 +1,5 @@
+import { choosePlaces, fetchPlaces, fetchWithTimeout, WeightedPlace } from './places';
+
 export type LatLng = { latitude: number; longitude: number };
 export type Vehicle = 'moto' | 'car' | 'bike';
 export type Mode = 'loop' | 'out' | 'pick';
@@ -71,6 +73,9 @@ export type RoadRoute = {
   snapped: LatLng[]; // each input point moved onto the nearest road
 };
 
+/** A stop on the ride. `kind` is null for a plain road point (no public place nearby). */
+export type Stop = LatLng & { name: string; kind: string | null };
+
 // Free OpenStreetMap routing (FOSSGIS). Fine for personal use; swap for your own server or a paid API at scale.
 const OSRM_BASE: Record<Vehicle, string> = {
   moto: 'https://routing.openstreetmap.de/routed-car/route/v1/driving/',
@@ -80,7 +85,7 @@ const OSRM_BASE: Record<Vehicle, string> = {
 
 export async function fetchRoadRoute(points: LatLng[], vehicle: Vehicle, signal?: AbortSignal): Promise<RoadRoute> {
   const path = points.map((p) => `${p.longitude.toFixed(6)},${p.latitude.toFixed(6)}`).join(';');
-  const res = await fetch(`${OSRM_BASE[vehicle]}${path}?overview=full&geometries=geojson`, { signal });
+  const res = await fetchWithTimeout(`${OSRM_BASE[vehicle]}${path}?overview=full&geometries=geojson`, {}, 15000, signal);
   if (!res.ok) throw new Error(`Routing failed (${res.status})`);
   const json = await res.json();
   if (json.code !== 'Ok' || !json.routes?.length) throw new Error(json.message || 'No road route found');
@@ -92,9 +97,11 @@ export async function fetchRoadRoute(points: LatLng[], vehicle: Vehicle, signal?
   };
 }
 
+export type RidePlan = { stops: Stop[]; road: RoadRoute | null; placesFailed: boolean };
+
 /**
- * Generate a ride and fit it to roads. If the road distance is far off the target,
- * resize the shape and try again (same seed, so it keeps its look).
+ * Build a ride through public places (petrol stations, parks, malls...) placed along the ride shape,
+ * then fit it to roads. If the road distance is far off the target, resize the shape and try again.
  */
 export async function planRide(opts: {
   start: LatLng;
@@ -105,22 +112,45 @@ export async function planRide(opts: {
   direction: Direction;
   seed: number;
   signal?: AbortSignal;
-}): Promise<{ waypoints: LatLng[]; road: RoadRoute | null }> {
+}): Promise<RidePlan> {
   const km = targetKm(opts.minutes, opts.vehicle);
+  const straight = km / ROAD_FACTOR;
+  // Far enough to cover the shape even after it is scaled up.
+  const reachKm = opts.mode === 'loop' ? straight / Math.PI : straight / 2;
+  const searchKm = Math.min(25, reachKm * 1.6 + 1);
+
+  let places: WeightedPlace[] = [];
+  let placesFailed = false;
+  try {
+    places = await fetchPlaces(opts.start, searchKm, opts.signal);
+  } catch (e) {
+    if (opts.signal?.aborted) throw e;
+    placesFailed = true;
+  }
+
   let scale = 1;
-  let best: { waypoints: LatLng[]; road: RoadRoute | null } | null = null;
+  let best: RidePlan | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const wps = generateWaypoints(opts.start, opts.mode, km, opts.direction, opts.seed, scale);
-    const pts = [opts.start, ...wps, opts.finish ?? opts.start];
+    const ideals = generateWaypoints(opts.start, opts.mode, km, opts.direction, opts.seed, scale);
+    const size = opts.mode === 'loop' ? (straight * scale) / (2 * Math.PI) : (straight * scale) / 2;
+    const picks = choosePlaces(ideals, places, opts.start, {
+      maxOffKm: Math.max(0.5, size * 0.6),
+      minFromStartKm: size * 0.4,
+      rand: rng((opts.seed * 7.31) % 1),
+    });
+    let stops: Stop[] = ideals.map((p, i) => picks[i] ?? { ...p, name: '', kind: null });
+
     let road: RoadRoute;
     try {
-      road = await fetchRoadRoute(pts, opts.vehicle, opts.signal);
+      road = await fetchRoadRoute([opts.start, ...stops, opts.finish ?? opts.start], opts.vehicle, opts.signal);
     } catch (e) {
       if (opts.signal?.aborted) throw e;
-      return best ?? { waypoints: wps, road: null }; // offline: still usable, the nav app routes it
+      return best ?? { stops, road: null, placesFailed }; // offline: still usable, the nav app routes it
     }
-    // Use the road-snapped stops so the nav app doesn't aim at a lake or a rooftop.
-    const candidate = { waypoints: road.snapped.slice(1, -1), road };
+    // Plain road points move onto the road itself; real places keep their own position.
+    stops = stops.map((s, i) => (s.kind ? s : { ...s, ...road.snapped[i + 1] }));
+
+    const candidate = { stops, road, placesFailed };
     if (!best || Math.abs(road.km - km) < Math.abs(best.road!.km - km)) best = candidate;
     const ratio = road.km / km;
     if (ratio > 0.8 && ratio < 1.25) break;

@@ -2,7 +2,7 @@ import * as Location from 'expo-location';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import MapView, { LongPressEvent, MapPressEvent, Marker, Polyline } from 'react-native-maps';
+import MapView, { LongPressEvent, MapPressEvent, MapViewProps, Marker, Polyline } from 'react-native-maps';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import { googleMapsUrl, wazeUrl } from './src/links';
@@ -13,11 +13,14 @@ import {
   Mode,
   RoadRoute,
   SPEED_KMH,
+  Stop,
   Vehicle,
   fetchRoadRoute,
   planRide,
   targetKm,
 } from './src/route';
+
+type PoiClickEvent = Parameters<NonNullable<MapViewProps['onPoiClick']>>[0];
 
 const MINUTE_CHOICES = [10, 15, 20, 30, 45, 60];
 const VEHICLES: { key: Vehicle; label: string }[] = [
@@ -62,7 +65,8 @@ function RideScreen() {
   const [direction, setDirection] = useState<Direction>('Any');
   const [seed, setSeed] = useState(Math.random());
 
-  const [stops, setStops] = useState<LatLng[]>([]);
+  const [stops, setStops] = useState<Stop[]>([]);
+  const [note, setNote] = useState<string | null>(null);
   const [road, setRoad] = useState<RoadRoute | null>(null);
   const [loading, setLoading] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
@@ -88,32 +92,64 @@ function RideScreen() {
   useEffect(() => {
     if (!start) return;
     const ctrl = new AbortController();
+    const cleanup = () => {
+      ctrl.abort();
+      setLoading(false);
+    };
     setRouteError(null);
+    setNote(null);
 
     if (mode === 'pick') {
       setRoad(null);
-      if (!stops.length) return;
+      if (!stops.length) {
+        setLoading(false);
+        return;
+      }
       setLoading(true);
       fetchRoadRoute([start, ...stops, finish ?? start], vehicle, ctrl.signal)
         .then(setRoad)
         .catch((e) => !ctrl.signal.aborted && setRouteError(e.message))
         .finally(() => !ctrl.signal.aborted && setLoading(false));
-      return () => ctrl.abort();
+      return cleanup;
     }
 
     setLoading(true);
     planRide({ start, finish, mode, minutes, vehicle, direction, seed, signal: ctrl.signal })
-      .then(({ waypoints, road }) => {
-        setStops(waypoints);
+      .then(({ stops, road, placesFailed }) => {
+        setStops(stops);
         setRoad(road);
-        if (!road) setRouteError('No internet for the road preview. The nav app will still route it.');
+        if (!road) setRouteError('Could not load the road preview. Google Maps or Waze will still route it.');
+        if (placesFailed) setNote('Could not load public places, so stops are plain road points. Check them before you go.');
+        else if (stops.some((s) => !s.kind)) setNote('No public place near some stops, so they are road points. Shuffle for others.');
       })
       .catch((e) => !ctrl.signal.aborted && setRouteError(e.message))
       .finally(() => !ctrl.signal.aborted && setLoading(false));
-    return () => ctrl.abort();
+    return cleanup;
     // stops is an output in loop/out modes, an input only in pick mode
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [start, finish, mode, minutes, vehicle, direction, seed, mode === 'pick' ? stops : null]);
+
+  // Give road points and tapped pins a street name so you know where you're heading.
+  useEffect(() => {
+    const unnamed = stops.filter((s) => !s.name);
+    if (!unnamed.length) return;
+    let cancelled = false;
+    Promise.all(
+      stops.map(async (s) => {
+        if (s.name) return s;
+        try {
+          const [a] = await Location.reverseGeocodeAsync(s);
+          const name = a?.street || a?.name || a?.district || a?.subregion;
+          return { ...s, name: name ? `Near ${name}` : 'Road point' };
+        } catch {
+          return { ...s, name: 'Road point' };
+        }
+      }),
+    ).then((named) => !cancelled && setStops((cur) => (cur === stops ? named : cur)));
+    return () => {
+      cancelled = true;
+    };
+  }, [stops]);
 
   // Keep the whole ride in view.
   useEffect(() => {
@@ -129,8 +165,16 @@ function RideScreen() {
   const onMapPress = (e: MapPressEvent) => {
     if (mode !== 'pick' || e.nativeEvent.action === 'marker-press') return;
     const c = e.nativeEvent.coordinate;
-    setStops((s) => (s.length >= 3 ? s : [...s, c]));
+    setStops((s) => (s.length >= 3 ? s : [...s, { ...c, name: '', kind: null }]));
   };
+  // Tapping a named place on the map (shop, park...) adds it with its real name.
+  const onPoiClick = (e: PoiClickEvent) => {
+    if (mode !== 'pick') return;
+    const { coordinate, name } = e.nativeEvent;
+    setStops((s) => (s.length >= 3 ? s : [...s, { ...coordinate, name: name.replace(/\n/g, ' '), kind: 'Place' }]));
+  };
+  const showOnMap = (p: LatLng) =>
+    mapRef.current?.animateToRegion({ ...p, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 400);
   const onLongPress = (e: LongPressEvent) => setFinish(e.nativeEvent.coordinate);
 
   const startAtMapCentre = async () => {
@@ -163,6 +207,7 @@ function RideScreen() {
         initialRegion={{ latitude: 3.1554, longitude: 101.7145, latitudeDelta: 0.08, longitudeDelta: 0.08 }}
         onPress={onMapPress}
         onLongPress={onLongPress}
+        onPoiClick={onPoiClick}
       >
         {road ? (
           <Polyline coordinates={road.coords} strokeColor={C.amber} strokeWidth={6} />
@@ -179,6 +224,8 @@ function RideScreen() {
             key={`${i}-${s.latitude}`}
             coordinate={s}
             anchor={{ x: 0.5, y: 0.5 }}
+            title={s.name || `Stop ${i + 1}`}
+            description={s.kind ?? 'Road point'}
             onPress={() => mode === 'pick' && setStops((all) => all.filter((_, j) => j !== i))}
           >
             <View style={styles.stopPin}>
@@ -200,7 +247,7 @@ function RideScreen() {
           <Text style={styles.title}>SPARE MINUTES RIDE</Text>
           <Text style={styles.bannerText}>
             {mode === 'pick'
-              ? 'Tap the map to add up to 3 stops. Tap a stop to remove it.'
+              ? 'Tap places on the map to add up to 3 stops. Tap a stop to remove it.'
               : 'Long-press the map to finish somewhere else. Tap END to clear it.'}
           </Text>
         </View>
@@ -248,6 +295,32 @@ function RideScreen() {
           </View>
           {routeError && <Text style={styles.error}>{routeError}</Text>}
 
+          {ready && (
+            <>
+              <Label>Where you'll go</Label>
+              <View style={styles.stopList}>
+                {[...stops.map((s, i) => ({ p: s as LatLng, n: String(i + 1), title: s.name || 'Finding name…', sub: s.kind ?? 'Road point' })),
+                  { p: end!, n: finish ? 'END' : '↩', title: finish ? 'Your finish point' : 'Back to start', sub: 'Finish' },
+                ].map((row, i) => (
+                  <Pressable key={i} style={styles.stopRow} onPress={() => showOnMap(row.p)}>
+                    <View style={styles.stopBadge}>
+                      <Text style={styles.stopBadgeText}>{row.n}</Text>
+                    </View>
+                    <View style={styles.stopInfo}>
+                      <Text style={styles.stopName} numberOfLines={1}>{row.title}</Text>
+                      <Text style={[styles.stopKind, row.sub === 'Road point' && styles.stopKindWarn]}>{row.sub}</Text>
+                    </View>
+                    <Pressable style={styles.wazeBtn} onPress={() => Linking.openURL(wazeUrl(row.p))} hitSlop={6}>
+                      <Text style={styles.wazeLegText}>Waze</Text>
+                    </Pressable>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={styles.hint}>Tap a stop to see it on the map. Waze takes one stop at a time.</Text>
+            </>
+          )}
+          {note && <Text style={styles.noteText}>{note}</Text>}
+
           {mode !== 'pick' && (
             <Pressable style={styles.shuffle} onPress={() => setSeed(Math.random())}>
               <Text style={styles.shuffleText}>↻  Shuffle route</Text>
@@ -262,17 +335,6 @@ function RideScreen() {
             <Text style={styles.goText}>Ride it in Google Maps</Text>
           </Pressable>
 
-          <Label>Waze, one leg at a time</Label>
-          <View style={styles.row}>
-            {ready &&
-              [...stops, end!].map((p, i) => (
-                <Pressable key={i} style={styles.wazeLeg} onPress={() => Linking.openURL(wazeUrl(p))}>
-                  <Text style={styles.wazeLegText}>
-                    {i < stops.length ? `Stop ${i + 1}` : finish ? 'Finish' : 'Back to start'}
-                  </Text>
-                </Pressable>
-              ))}
-          </View>
         </ScrollView>
       </SafeAreaView>
     </View>
@@ -358,7 +420,17 @@ const styles = StyleSheet.create({
   shuffleText: { fontWeight: '700', fontSize: 15, color: C.fg },
   go: { borderRadius: 10, paddingVertical: 15, alignItems: 'center' },
   goText: { color: '#fff', fontWeight: '800', fontSize: 16, letterSpacing: 0.5 },
-  wazeLeg: { borderWidth: 1.5, borderColor: C.waze, borderRadius: 8, paddingVertical: 9, paddingHorizontal: 14 },
+  stopList: { borderWidth: 1, borderColor: C.line, borderRadius: 10 },
+  stopRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 9, paddingHorizontal: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.line },
+  stopBadge: { minWidth: 30, height: 30, borderRadius: 15, paddingHorizontal: 4, backgroundColor: C.asphalt, alignItems: 'center', justifyContent: 'center' },
+  stopBadgeText: { color: '#fff', fontWeight: '800', fontSize: 12 },
+  stopInfo: { flex: 1, minWidth: 0 },
+  stopName: { color: C.fg, fontWeight: '600', fontSize: 14 },
+  stopKind: { color: C.muted, fontSize: 12 },
+  stopKindWarn: { color: '#a15c00' },
+  wazeBtn: { borderWidth: 1.5, borderColor: C.waze, borderRadius: 8, paddingVertical: 6, paddingHorizontal: 10 },
+  hint: { color: C.muted, fontSize: 12 },
+  noteText: { color: '#a15c00', fontSize: 13 },
   wazeLegText: { color: C.waze, fontWeight: '700' },
   stopPin: {
     width: 30, height: 30, borderRadius: 15, backgroundColor: '#fff',
